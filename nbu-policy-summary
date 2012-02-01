@@ -1,5 +1,11 @@
 #!/usr/local/bin/perl -w
 
+#
+# create spreadsheet summary of netbackup policy coverage.
+# one worksheet for every host
+#
+# al marti 	marti@rootgroup.com
+
 use Data::Dumper;
 use List::Compare;
 use Spreadsheet::WriteExcel;
