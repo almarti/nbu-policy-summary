@@ -1,0 +1,380 @@
+#!/usr/local/bin/perl -w
+
+use Data::Dumper;
+use List::Compare;
+use Spreadsheet::WriteExcel;
+
+$now = localtime;
+#print "Active Netbackup Policies as of: $now \n";
+
+$date=`date +%Y-%m-%d`;
+chomp($date);
+
+# get list of policies
+@NBU_policies=`bppllist`;
+
+foreach $policy (@NBU_policies) {
+	chop($policy);
+	
+	# get details of $policy
+	@lines=`bppllist $policy -L`;
+
+	# weed out inactive policies
+	if( grep( /^Active:\s+no$/, @lines ) ) {
+		# save policy in array of inactive policies
+		push( @inactive, $policy );
+		next;
+	}
+
+	foreach $line (@lines) {
+
+#		chop($line);
+		if ( $line =~ /^Policy Name:\s*(\S+)/ ) {
+			$policyname = $1;
+			undef($SQL);
+#			print "=" x 80;
+#			print "\nPolicy: $1\n";
+		} elsif( $line =~ /^Policy Type:\s+(\S+)\s+(\S+)/ ) {
+			$type=$1;
+			$typenum=$2;
+#			print "Type: $type $typenum\n";
+
+			# remove () from $typenum
+			$typenum =~ s/\D//g;
+
+			# typenum of 15 means SQL backup
+			if( $typenum == 15) {
+				$SQL++;
+			} else {
+				undef($SQL);
+			}
+			
+			$policies{$policyname}{"type"} = $type;
+			$policies{$policyname}{"typenum"} = $typenum;
+
+		} elsif( $line =~ /^Client.HW.OS.Pri:\s*(\S+)/ ) {
+			$client = $1;
+			if( !defined($inClients) ) {
+#				print "\tClients:\n"; 
+				$inClients++;
+			}
+#			print "\t\t$client\n";
+			if( defined($SQL) ) {
+				push(@sqlclients, $client);
+			}
+
+			if( $policies{$policyname}{"typenum"} == 15 ) {
+				push( @{ $policies{$policyname}{"sql-clients"} }, $client );
+			} else {
+				push( @{ $policies{$policyname}{"clients"} }, $client );
+			}
+
+			# add policy to list of policies for this client
+			push( @{ $clients{$client}{"policies"} }, $policyname ); 
+
+			
+
+		} elsif( $line =~ /^Include:\s*(\S.*$)/ ) {
+			undef($inClients);
+	
+			if( !defined($inBackupSelections) ) {
+#				print "\tBackup Selections:\n";
+				$inBackupSelections++;
+			}
+			if( $line =~ /NEW_STREAM|UNSET_ALL|UNSET/ ) {
+				next;
+			}
+#			print "\t\t$1\n";
+
+			push( @{ $policies{$policyname}{"backup-selections"} }, $1 );
+
+			foreach $c (@{ $policies{$policyname}{"clients"} }) {
+				push( @{ $clients{$c}{"backup-selections"} }, $1 );
+			}
+#		} elsif( $line =~ /^Schedule:\s*(\w.*)/ || defined($inSchedule) ) {
+#			undef($inBackupSelections);
+#			$inSchedule++;
+#			$schedtype=$1;
+#			$policies{$policyname}{"Schedule"}{$schedtype}++;
+
+		} else {
+			undef($inBackupSelections);
+			if( defined($SQL) ) {
+				foreach $sqlclient (@sqlclients) {
+#					print "\t\t${sqlclient}:\n";
+					@instances = `bplist -C $sqlclient -t 15 -R /  2>&1`;
+
+					%seen = (); 
+					foreach $item (@instances) { 
+						(undef,undef,undef,undef,$instance,undef) = split(/\./,$item,6);
+						push(@uniq, $instance) unless $seen{$instance}++; 
+					}
+#					foreach $i (@uniq) {
+#						print "\t\t\tInstance: $i\n";
+#					}
+					undef(%seen);
+					undef(@instances);
+					undef(@uniq);
+				}
+				undef(@sqlclients);
+			}
+			
+		}
+	
+	}
+
+	
+}
+
+# create array of active policies
+$lc = List::Compare->new(\@NBU_policies, \@inactive);
+@active_policies = $lc->get_unique;
+
+# process sql client instances
+foreach $policy (@active_policies) {
+
+	if( $policies{$policy}{"typenum"} == 15 ) {
+
+		foreach $sqlclient (@{ $policies{$policy}{"sql-clients"} })  {
+			my $instance = "";
+			my %seen = ();
+			my @DBs = ();
+			my $item = "";
+			my $db = "";
+
+			@DBs = `bplist -C $sqlclient -t 15 -R /  2>&1`;	
+			foreach $item (@DBs)  { 
+				(undef,undef,$instance,undef,$db,undef) = split(/\./,$item,6);
+				$instance=$instance.".db.".$db;
+
+				# only push the instance if we have not seen it before
+				unless( $seen{$instance}++ ) {
+					push( @{ $policies{$policy}{$sqlclient}{"instances"} }, $instance ); 
+				} 
+
+				# need to escape the backslash in $instance or else the grep will not
+				# match correctly below
+				$instance2 = $instance;
+				$instance2 =~ s/\\/\\\\/g;
+				unless( grep( /$instance2/, @{ $clients{$sqlclient}{"instances"} } ) ) {
+					push( @{ $clients{$sqlclient}{"instances"} }, $instance ); 
+				}
+			}
+		}
+	}
+}
+
+
+# use datadumper to display data structures for debugging purposes
+#print Dumper \%policies;
+
+#print "+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++\n";
+print Dumper \%clients;
+
+###############################################################################################################################################
+    
+    ###############################################################################
+    #
+    # Functions used for Autofit.
+    #
+    ###############################################################################
+    
+    ###############################################################################
+    #
+    # Adjust the column widths to fit the longest string in the column.
+    #
+    sub autofit_columns {
+    
+        my $worksheet = shift;
+        my $col       = 0;
+    
+        for my $width (@{$worksheet->{__col_widths}}) {
+    
+            $worksheet->set_column($col, $col, $width) if $width;
+            $col++;
+        }
+    }
+    
+    
+    ###############################################################################
+    #
+    # The following function is a callback that was added via add_write_handler()
+    # above. It modifies the write() function so that it stores the maximum
+    # unwrapped width of a string in a column.
+    #
+    sub store_string_widths {
+    
+        my $worksheet = shift;
+        my $col       = $_[1];
+        my $token     = $_[2];
+    
+        # Ignore some tokens that we aren't interested in.
+        return if not defined $token;       # Ignore undefs.
+        return if $token eq '';             # Ignore blank cells.
+        return if ref $token eq 'ARRAY';    # Ignore array refs.
+        return if $token =~ /^=/;           # Ignore formula
+    
+        # Ignore numbers
+        return if $token =~ /^([+-]?)(?=\d|\.\d)\d*(\.\d*)?([Ee]([+-]?\d+))?$/;
+    
+        # Ignore various internal and external hyperlinks. In a real scenario
+        # you may wish to track the length of the optional strings used with
+        # urls.
+        return if $token =~ m{^[fh]tt?ps?://};
+        return if $token =~ m{^mailto:};
+        return if $token =~ m{^(?:in|ex)ternal:};
+    
+    
+        # We store the string width as data in the Worksheet object. We use
+        # a double underscore key name to avoid conflicts with future names.
+        #
+        my $old_width    = $worksheet->{__col_widths}->[$col];
+        my $string_width = string_width($token);
+    
+        if (not defined $old_width or $string_width > $old_width) {
+            # You may wish to set a minimum column width as follows.
+            #return undef if $string_width < 10;
+    
+            $worksheet->{__col_widths}->[$col] = $string_width;
+        }
+    
+    
+        # Return control to write();
+        return undef;
+    }
+    
+    
+    ###############################################################################
+    #
+    # Very simple conversion between string length and string width for Arial 10.
+    # See below for a more sophisticated method.
+    #
+#    sub string_width {
+#    
+##        return 0.9 * length $_[0];
+#        return 1.0 * length $_[0];
+#    }
+
+
+    ############################################################################
+    #
+    # This function uses an external module to get a more accurate width for a
+    # string. Note that in a real program you could "use" the module instead of
+    # "require"-ing it and you could make the Font object global to avoid repeated
+    # initialisation.
+    #
+    # Note also that the $pixel_width to $cell_width is specific to Arial. For
+    # other fonts you should calculate appropriate relationships. A future version
+    # of S::WE will provide a way of specifying column widths in pixels instead of
+    # cell units in order to simplify this conversion.
+    #
+    sub string_width {
+    
+        require Font::TTFMetrics;
+    
+        #my $arial        = Font::TTFMetrics->new('c:\windows\fonts\arial.ttf');
+        my $arial        = Font::TTFMetrics->new('/usr/openwin/lib/locale/iso_8859_8/X11/fonts/TrueType/arial__h.ttf');
+    
+        my $font_size    = 12;
+        my $dpi          = 96;
+        my $units_per_em = $arial->get_units_per_em();
+        my $font_width   = $arial->string_width($_[0]);
+    
+        # Convert to pixels as per TTFMetrics docs.
+        my $pixel_width  = 6 + $font_width *$font_size *$dpi /(72 *$units_per_em);
+    
+        # Add extra pixels for border around text.
+        $pixel_width  += 10;
+    
+        # Convert to cell width (for Arial) and for cell widths > 1.
+        my $cell_width   = ($pixel_width -5) /7;
+    
+        return $cell_width;
+    
+    }
+
+
+
+
+###############################################################################################################################################
+
+
+# write out spreadsheet with results
+#my @header = qw(Server Backup_Selections SQL_Instances Frequency-Fulls Frequency-Incr Retention Backup_Data_Owner Signature);
+my @header = qw(Server Backup_Selections SQL_Instances NBU_Policies);
+
+# create  workbook
+my $workbook = Spreadsheet::WriteExcel->new("nbu-backup-coverage-${date}\.xls");
+
+# set banner format
+my $banner = $workbook->add_format(
+	bold        => 1,
+	color       => 'brown',
+        size        => 20,
+        valign      => 'vcentre',
+        align       => 'left',
+        indent      => 1,
+);
+
+# create bold blue format
+my $header = $workbook->add_format(
+	bold	=> 1,
+	size	=> 12,
+	color	=> 'gray',
+);
+
+foreach $client ( sort keys %clients) {
+	my $worksheet = $workbook->add_worksheet($client);
+
+	# write out the banner
+	$worksheet->merge_range('A1:K4', "$client Backup Coverage Report        $now ", $banner);
+
+	# used to autofit column widths
+	$worksheet->add_write_handler(qr[\w], \&store_string_widths);
+
+	# write out column headers
+	$worksheet->write(4, 0, \@header, $header);
+
+	# fill out server column
+	$worksheet->write(5, 0, $client);
+
+	# fill out backup selections column
+	$row_offset = 5;
+	# sort array members
+	@{ $clients{$client}{"backup-selections"} } = sort @{ $clients{$client}{"backup-selections"} }; 
+	foreach $selection ( @{ $clients{$client}{"backup-selections"} } ) {
+		$worksheet->write($row_offset++, 1, $selection);
+	} 
+
+	# fill out sql instances column
+	$row_offset = 5;
+	# sort array members
+	if( defined( @{ $clients{$client}{"instances"} } ) ) {
+		@{ $clients{$client}{"instances"} } = sort @{ $clients{$client}{"instances"} };
+		foreach $selection ( @{ $clients{$client}{"instances"} } ) {
+			$worksheet->write($row_offset++, 2, $selection);
+		} 
+	}
+
+	# fill out policies column
+	$row_offset = 5;
+	# sort array members
+	@{ $clients{$client}{"policies"} } = sort @{ $clients{$client}{"policies"} }; 
+	foreach $policy ( @{ $clients{$client}{"policies"} } ) {
+		$worksheet->write($row_offset++, 3, $policy);
+	} 
+
+	# autofit all our columns now that we are done writing this worksheet
+    	autofit_columns($worksheet);
+}
+$workbook->close();
+	
+
+
+
+
+exit;
+
+# the inspiration for this script started with this line of code i found on the internet
+# it has evolved into completely different
+# bppllist -allpolicies -L | perl -lne 'if (/^Policy Name:\s*(\S+)/){print "Policy Name: $1\n\tClients:";$pol=$1;} elsif(/^Client.HW.OS.Pri:\s*(\S+)/){print "\t\t$1";} elsif(/^Include:\s*(\S.*$)/){print "\t\t\t$1";}'
